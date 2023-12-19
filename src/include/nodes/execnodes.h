@@ -2099,6 +2099,14 @@ typedef struct MergeJoinState
 typedef struct HashJoinTupleData *HashJoinTuple;
 typedef struct HashJoinTableData *HashJoinTable;
 
+typedef struct BucketProbeState
+{
+	uint32 	HashValue;
+	int 	stage;
+	HashJoinTuple	CurInner;
+	TupleTableSlot	*outer;
+} BucketProbeState;
+
 typedef struct HashJoinState
 {
 	JoinState	js;				/* its first field is NodeTag */
@@ -2110,15 +2118,21 @@ typedef struct HashJoinState
 	uint32		hj_CurHashValue;
 	int			hj_CurBucketNo;
 	int			hj_CurSkewBucketNo;
+	int 		CurProbeIndex;
+	int 		no_op_flag;
+	int			GroupSize;
 	HashJoinTuple hj_CurTuple;
 	TupleTableSlot *hj_OuterTupleSlot;
 	TupleTableSlot *hj_HashTupleSlot;
 	TupleTableSlot *hj_NullOuterTupleSlot;
 	TupleTableSlot *hj_NullInnerTupleSlot;
 	TupleTableSlot *hj_FirstOuterTupleSlot;
+	// Tuplestorestate 	*tuplestorestate;	/* save a batch of tuples to be scaned */
+	BucketProbeState	*ScanGroup;		/* AMAC state machine group */
 	int			hj_JoinState;
 	bool		hj_MatchedOuter;
 	bool		hj_OuterNotEmpty;
+	bool		EndBatch;
 } HashJoinState;
 
 
