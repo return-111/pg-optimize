@@ -194,6 +194,14 @@
 /* Returns true if doing null-fill on inner relation */
 #define HJ_FILL_INNER(hjstate)	((hjstate)->hj_NullOuterTupleSlot != NULL)
 
+#define ProbeNext(hjtup) \
+    do { \
+        (hjtup) = (hjtup)->next.unshared; \
+        if ((hjtup) != NULL) { \
+            __builtin_prefetch((char *)(hjtup)); \
+        } \
+    } while (0)
+
 static TupleTableSlot *ExecHashJoinOuterGetTuple(PlanState *outerNode,
 												 HashJoinState *hjstate,
 												 uint32 *hashvalue);
@@ -225,7 +233,7 @@ static void ExecParallelHashJoinPartitionOuter(HashJoinState *hjstate);
 static pg_attribute_always_inline TupleTableSlot *
 ExecHashJoinImpl(PlanState *pstate, bool parallel)
 {
-	elog(INFO, "Exec Parallel HashJoin");
+	elog(ERROR, "Exec Parallel HashJoin");
 	HashJoinState *node = castNode(HashJoinState, pstate);
 	PlanState  *outerNode;
 	HashState  *hashNode;
@@ -677,7 +685,7 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 static pg_attribute_always_inline TupleTableSlot *
 ExecNonParallelHashJoinImpl(PlanState *pstate)
 {
-	elog(INFO, "Exec NonParallel HashJoin");
+	// elog(INFO, "Exec NonParallel HashJoin");
 	HashJoinState *node = castNode(HashJoinState, pstate);
 	PlanState  *outerNode;
 	HashState  *hashNode;
@@ -685,6 +693,8 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 	ExprState  *otherqual;
 	ExprContext *econtext;
 	HashJoinTable hashtable;
+	TupleTableSlot *outerTupleSlot;
+	uint32		hashvalue;
 	int			batchno;
 	int			groupidx;
 	BucketProbeState *CurState;
@@ -752,16 +762,21 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 				 * from the outer plan node.  If we succeed, we have to stash
 				 * it away for later consumption by ExecHashJoinOuterGetTuple.
 				 */
+				
+				/* cyz
+				 * Try to fetch a tuple anyway, get a tuple descriptor.
+				 */
+				node->hj_FirstOuterTupleSlot = ExecProcNode(outerNode);
 				if (HJ_FILL_INNER(node))
 				{
 					/* no chance to not build the hash table */
-					node->hj_FirstOuterTupleSlot = NULL;
+					// node->hj_FirstOuterTupleSlot = NULL;
 				}
 				else if (HJ_FILL_OUTER(node) ||
 						 (outerNode->plan->startup_cost < hashNode->ps.plan->total_cost &&
 						  !node->hj_OuterNotEmpty))
 				{
-					node->hj_FirstOuterTupleSlot = ExecProcNode(outerNode);
+					
 					if (TupIsNull(node->hj_FirstOuterTupleSlot))
 					{
 						node->hj_OuterNotEmpty = false;
@@ -770,8 +785,8 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 					else
 						node->hj_OuterNotEmpty = true;
 				}
-				else
-					node->hj_FirstOuterTupleSlot = NULL;
+				// else
+				// 	node->hj_FirstOuterTupleSlot = NULL;
 
 				/*
 				 * Create the hash table.  If using Parallel Hash, then
@@ -807,7 +822,7 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 				 * began scanning the outer relation
 				 */
 				hashtable->nbatch_outstart = hashtable->nbatch;
-
+				elog(INFO, "Hybrid Hash join: %d batches", hashtable->nbatch);
 				/*
 				 * Reset OuterNotEmpty for scan.  (It's OK if we fetched a
 				 * tuple above, because ExecHashJoinOuterGetTuple will
@@ -815,13 +830,15 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 				 */
 				node->hj_OuterNotEmpty = false;
 
-				// node->tuplestorestate = tuplestore_begin_heap(true, false, work_mem);
-				node->ScanGroup = palloc0_array(BucketProbeState, node->GroupSize);
-
+				node->ScanGroup = palloc0_array(BucketProbeState, node->GroupSize);				
+				Assert(!TupIsNull(node->hj_FirstOuterTupleSlot));
 				for (int i = 0; i < node->GroupSize; i++) {
 					node->ScanGroup[i].stage = NEED_NEW_KEY;
+					node->ScanGroup[i].outer = MakeSingleTupleTableSlot(node->hj_FirstOuterTupleSlot->tts_tupleDescriptor, 
+																		&TTSOpsMinimalTuple);
 				}
-
+				
+				CurState = &node->ScanGroup[groupidx];
 				node->hj_JoinState = HJ_NEED_NEW_OUTER;
 				/* Load first tuple */
 				/* FALL THRU */
@@ -833,10 +850,10 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 				 */
 				
 				Assert(CurState->stage == NEED_NEW_KEY);
-				CurState->outer =
-					ExecHashJoinOuterGetTuple(outerNode, node, &CurState->HashValue);
-
-				if (TupIsNull(CurState->outer))
+				outerTupleSlot =
+					ExecHashJoinOuterGetTuple(outerNode, node, &hashvalue);
+				
+				if (TupIsNull(outerTupleSlot))
 				{
 					// /* end of batch, or maybe whole join */
 					// if (HJ_FILL_INNER(node))
@@ -859,17 +876,17 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 					continue;
 				}
 
-				node->hj_MatchedOuter = false;
+				// node->hj_MatchedOuter = false;
 
 				/*
 				 * Find the corresponding bucket for this tuple in the main
 				 * hash table or skew hash table.
 				 */
-				node->hj_CurHashValue = CurState->HashValue;
-				ExecHashGetBucketAndBatch(hashtable, CurState->HashValue,
+				node->hj_CurHashValue = hashvalue;
+				ExecHashGetBucketAndBatch(hashtable, hashvalue,
 										  &node->hj_CurBucketNo, &batchno);
 				node->hj_CurSkewBucketNo = ExecHashGetSkewBucket(hashtable,
-																 CurState->HashValue);
+																 hashvalue);
 
 				/*
 				 * The tuple might not belong to the current batch (where
@@ -879,7 +896,7 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 					node->hj_CurSkewBucketNo == INVALID_SKEW_BUCKET_NO)
 				{
 					bool		shouldFree;
-					MinimalTuple mintuple = ExecFetchSlotMinimalTuple(CurState->outer,
+					MinimalTuple mintuple = ExecFetchSlotMinimalTuple(outerTupleSlot,
 																	  &shouldFree);
 
 					/*
@@ -888,7 +905,7 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 					 */
 					Assert(parallel_state == NULL);
 					Assert(batchno > hashtable->curbatch);
-					ExecHashJoinSaveTuple(mintuple, CurState->HashValue,
+					ExecHashJoinSaveTuple(mintuple, hashvalue,
 										  &hashtable->outerBatchFile[batchno],
 										  hashtable);
 
@@ -899,6 +916,20 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 					continue;
 				}
 				
+				CurState->HashValue = hashvalue;
+				// CurState->outer = MakeSingleTupleTableSlot(outerTupleSlot->tts_tupleDescriptor, &TTSOpsBufferHeapTuple);
+				// ExecCopySlot(CurState->outer, outerTupleSlot);
+				bool 		shouldFree;
+				MinimalTuple mtuple = ExecFetchSlotMinimalTuple(outerTupleSlot, 
+																&shouldFree);
+				
+				ExecForceStoreMinimalTuple(mtuple, CurState->outer, shouldFree);
+
+				CurState->MatchedOuter = false;
+				// for (int i = 0; i < node->GroupSize; i++) {
+				// 	print_slot(node->ScanGroup[i].outer);
+				// }
+
 				/* cyz
 				 * Locate the bucket tuple, prefetch address and process next state.
 				 */
@@ -908,7 +939,8 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 					CurState->CurInner = hashtable->buckets.unshared[node->hj_CurBucketNo];
 				
 				CurState->stage = PROBING;
-				__builtin_prefetch((char *) CurState->CurInner);
+				if (CurState->CurInner != NULL)
+					__builtin_prefetch((char *) CurState->CurInner);
 				node->hj_JoinState = HJ_PROC_OUTER;
 
 				if (++node->CurProbeIndex == node->GroupSize)
@@ -1034,8 +1066,14 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 					case PROBING:
 
 						/* check hashvalue in bucket */
-						if (CurState->CurInner != NULL && 
-							CurState->CurInner->hashvalue == CurState->HashValue)
+						if(CurState->CurInner == NULL)
+						{
+							/* out of matches; check for possible outer-join fill */
+							node->hj_JoinState = HJ_FILL_OUTER_TUPLE;
+							// CurState->stage = NEED_NEW_KEY;
+							continue;
+						}
+						else if (CurState->CurInner->hashvalue == CurState->HashValue)
 						{
 							TupleTableSlot *inntuple;
 
@@ -1051,8 +1089,7 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 								
 								if (joinqual == NULL || ExecQual(joinqual, econtext))
 								{
-									node->hj_MatchedOuter = true;
-
+									CurState->MatchedOuter = true;
 
 									/*
 									 * This is really only needed if HJ_FILL_INNER(node), but
@@ -1064,7 +1101,8 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 									/* In an antijoin, we never return a matched tuple */
 									if (node->js.jointype == JOIN_ANTI)
 									{
-										CurState->outer = NULL;
+										ExecClearTuple(CurState->outer);
+										// CurState->outer = NULL;
 										CurState->stage = NEED_NEW_KEY;
 										break;
 									}
@@ -1077,9 +1115,7 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 									if (node->js.jointype == JOIN_RIGHT_ANTI)
 									{
 										// continue;
-										CurState->CurInner = CurState->CurInner->next.unshared;
-										if (CurState->CurInner != NULL)
-											__builtin_prefetch((char *) CurState->CurInner);
+										ProbeNext(CurState->CurInner);
 										break;
 									}
 										
@@ -1092,13 +1128,19 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 									if (node->js.single_match)
 									{
 										// node->hj_JoinState = HJ_NEED_NEW_OUTER;
-										CurState->outer = NULL;
+										ExecClearTuple(CurState->outer);
+										// CurState->outer = NULL;
 										CurState->stage = NEED_NEW_KEY;
 										break;
 									}
 
-									if (otherqual == NULL || ExecQual(otherqual, econtext))
+									ProbeNext(CurState->CurInner);
+
+									if (otherqual == NULL || ExecQual(otherqual, econtext)) {
+										if (++node->CurProbeIndex == node->GroupSize)
+											node->CurProbeIndex = 0;
 										return ExecProject(node->js.ps.ps_ProjInfo);
+									}
 									else
 										InstrCountFiltered2(node, 1);
 								}
@@ -1108,17 +1150,8 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 							else {
 								/* probe next; check if it is the end of bucket */
 
-								CurState->CurInner = CurState->CurInner->next.unshared;
-								if (CurState->CurInner != NULL)
-									__builtin_prefetch((char *) CurState->CurInner);
+								ProbeNext(CurState->CurInner);
 							}
-						}
-						else {
-							/* out of matches; check for possible outer-join fill */
-							
-							node->hj_JoinState = HJ_FILL_OUTER_TUPLE;
-							CurState->stage = NEED_NEW_KEY;
-							continue;
 						}
 						break;
 
@@ -1144,15 +1177,16 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 				 * whether to emit a dummy outer-join tuple.  Whether we emit
 				 * one or not, the next state is NEED_NEW_OUTER.
 				 */
-				node->hj_JoinState = HJ_NEED_NEW_OUTER;
-
-				if (!node->hj_MatchedOuter &&
+				node->hj_JoinState = HJ_PROC_OUTER;
+				CurState->stage = NEED_NEW_KEY;
+				if (!CurState->MatchedOuter &&
 					HJ_FILL_OUTER(node))
 				{
 					/*
 					 * Generate a fake join tuple with nulls for the inner
 					 * tuple, and return it if it passes the non-join quals.
 					 */
+					econtext->ecxt_outertuple = CurState->outer;
 					econtext->ecxt_innertuple = node->hj_NullInnerTupleSlot;
 
 					if (otherqual == NULL || ExecQual(otherqual, econtext))
@@ -1203,6 +1237,9 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 				node->EndBatch = false;
 				node->no_op_flag = 0;
 				for (int i = 0; i < node->GroupSize; i++) {
+					if (!TupIsNull(node->ScanGroup[i].outer)) {
+						ExecClearTuple(node->ScanGroup[i].outer);
+					}
 					node->ScanGroup[i].stage = NEED_NEW_KEY;
 				}
 				node->CurProbeIndex = 0;
@@ -1231,7 +1268,8 @@ ExecHashJoin(PlanState *pstate)
 	 * On sufficiently smart compilers this should be inlined with the
 	 * parallel-aware branches removed.
 	 */
-	return ExecHashJoinImpl(pstate, false);
+	// return ExecHashJoinImpl(pstate, false);
+	return ExecNonParallelHashJoinImpl(pstate);
 }
 
 /* ----------------------------------------------------------------
@@ -1396,10 +1434,11 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	hjstate->hj_MatchedOuter = false;
 	hjstate->hj_OuterNotEmpty = false;
 
+	hjstate->ScanGroup = NULL;
 	hjstate->CurProbeIndex = 0;
 	hjstate->no_op_flag = 0;
 	hjstate->EndBatch = false;
-	hjstate->GroupSize = 20;
+	hjstate->GroupSize = 5;
 
 	return hjstate;
 }
@@ -1422,7 +1461,14 @@ ExecEndHashJoin(HashJoinState *node)
 		node->hj_HashTable = NULL;
 	}
 	
-	pfree(node->ScanGroup);
+	for (int i = 0; i < node->GroupSize; i++) {
+		ReleaseTupleDesc(node->ScanGroup[i].outer->tts_tupleDescriptor);
+		if (!TupIsNull(node->ScanGroup[i].outer)) {
+			ExecClearTuple(node->ScanGroup[i].outer);
+		}
+	}
+	if (node->ScanGroup != NULL)
+		pfree(node->ScanGroup);
 	/*
 	 * clean up subtrees
 	 */

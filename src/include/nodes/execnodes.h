@@ -2105,6 +2105,7 @@ typedef struct BucketProbeState
 	int 	stage;
 	HashJoinTuple	CurInner;
 	TupleTableSlot	*outer;
+	bool	MatchedOuter;
 } BucketProbeState;
 
 typedef struct HashJoinState
