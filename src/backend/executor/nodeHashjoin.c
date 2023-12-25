@@ -194,13 +194,18 @@
 /* Returns true if doing null-fill on inner relation */
 #define HJ_FILL_INNER(hjstate)	((hjstate)->hj_NullOuterTupleSlot != NULL)
 
+#define ENABLE_PREFETCH;
+#ifdef ENABLE_PREFETCH
 #define ProbeNext(hjtup) \
     do { \
         (hjtup) = (hjtup)->next.unshared; \
         if ((hjtup) != NULL) { \
-            __builtin_prefetch((char *)(hjtup)); \
+            __builtin_prefetch((char *)(hjtup) + HJTUPLE_OVERHEAD); \
         } \
     } while (0)
+#else
+#define ProbeNext(hjtup) (hjtup) = (hjtup)->next.unshared
+#endif
 
 static TupleTableSlot *ExecHashJoinOuterGetTuple(PlanState *outerNode,
 												 HashJoinState *hjstate,
@@ -685,7 +690,6 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 static pg_attribute_always_inline TupleTableSlot *
 ExecNonParallelHashJoinImpl(PlanState *pstate)
 {
-	// elog(INFO, "Exec NonParallel HashJoin");
 	HashJoinState *node = castNode(HashJoinState, pstate);
 	PlanState  *outerNode;
 	HashState  *hashNode;
@@ -822,7 +826,7 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 				 * began scanning the outer relation
 				 */
 				hashtable->nbatch_outstart = hashtable->nbatch;
-				elog(INFO, "Hybrid Hash join: %d batches", hashtable->nbatch);
+				// elog(INFO, "Hybrid Hash join: %d batches", hashtable->nbatch);
 				/*
 				 * Reset OuterNotEmpty for scan.  (It's OK if we fetched a
 				 * tuple above, because ExecHashJoinOuterGetTuple will
@@ -940,7 +944,9 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 				
 				CurState->stage = PROBING;
 				if (CurState->CurInner != NULL)
-					__builtin_prefetch((char *) CurState->CurInner);
+				#ifdef ENABLE_PREFETCH
+					__builtin_prefetch((char *)(CurState->CurInner) + HJTUPLE_OVERHEAD);
+				#endif
 				node->hj_JoinState = HJ_PROC_OUTER;
 
 				if (++node->CurProbeIndex == node->GroupSize)
@@ -1073,7 +1079,8 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 							// CurState->stage = NEED_NEW_KEY;
 							continue;
 						}
-						else if (CurState->CurInner->hashvalue == CurState->HashValue)
+						
+						if (CurState->CurInner->hashvalue == CurState->HashValue)
 						{
 							TupleTableSlot *inntuple;
 
@@ -1104,7 +1111,7 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 										ExecClearTuple(CurState->outer);
 										// CurState->outer = NULL;
 										CurState->stage = NEED_NEW_KEY;
-										break;
+										continue;
 									}
 
 									/*
@@ -1131,10 +1138,10 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 										ExecClearTuple(CurState->outer);
 										// CurState->outer = NULL;
 										CurState->stage = NEED_NEW_KEY;
-										break;
 									}
-
-									ProbeNext(CurState->CurInner);
+									else
+										ProbeNext(CurState->CurInner);
+									
 
 									if (otherqual == NULL || ExecQual(otherqual, econtext)) {
 										if (++node->CurProbeIndex == node->GroupSize)
@@ -1143,16 +1150,14 @@ ExecNonParallelHashJoinImpl(PlanState *pstate)
 									}
 									else
 										InstrCountFiltered2(node, 1);
+									break;
 								}
 								else
 									InstrCountFiltered1(node, 1);
 							}
-							else {
-								/* probe next; check if it is the end of bucket */
-
-								ProbeNext(CurState->CurInner);
-							}
 						}
+						/* probe next; check if it is the end of bucket */
+						ProbeNext(CurState->CurInner);
 						break;
 
 					case NO_OP:
@@ -1461,14 +1466,16 @@ ExecEndHashJoin(HashJoinState *node)
 		node->hj_HashTable = NULL;
 	}
 	
-	for (int i = 0; i < node->GroupSize; i++) {
-		ReleaseTupleDesc(node->ScanGroup[i].outer->tts_tupleDescriptor);
-		if (!TupIsNull(node->ScanGroup[i].outer)) {
-			ExecClearTuple(node->ScanGroup[i].outer);
-		}
-	}
 	if (node->ScanGroup != NULL)
+	{
+		for (int i = 0; i < node->GroupSize; i++)
+		{
+			ReleaseTupleDesc(node->ScanGroup[i].outer->tts_tupleDescriptor);
+			if (!TupIsNull(node->ScanGroup[i].outer))
+				ExecClearTuple(node->ScanGroup[i].outer);
+	}
 		pfree(node->ScanGroup);
+	}
 	/*
 	 * clean up subtrees
 	 */
